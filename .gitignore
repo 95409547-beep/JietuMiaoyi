@@ -1,0 +1,20 @@
+# macOS 与外接磁盘元数据
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# 构建与打包产物
+build/
+dist/
+*.app/
+*.dmg
+*.icns
+*.iconset/
+
+# Xcode / SwiftPM 缓存
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
