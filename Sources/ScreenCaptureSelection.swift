@@ -1,11 +1,19 @@
 import Cocoa
 import ScreenCaptureKit
 
+/// 框选完成后的执行动作
+enum CaptureSelectionAction {
+    case translate
+    case pin
+    case copyImage
+}
+
 /// 选区截图结果
 struct CapturedRegionResult {
     let croppedImage: CGImage
     let globalScreenRect: NSRect
     let scaleFactor: CGFloat
+    let action: CaptureSelectionAction
 }
 
 /// 负责瞬间定格屏幕并弹出高颜值框选遮罩
@@ -73,11 +81,14 @@ final class ScreenCaptureSelector {
         scale: CGFloat,
         completion: @escaping (CapturedRegionResult?) -> Void
     ) {
-        let win = RegionSelectionWindow(screen: screen, snapshot: snapshot) { [weak self] selectedTopLeftRect in
+        let win = RegionSelectionWindow(screen: screen, snapshot: snapshot) { [weak self] selectedTopLeftRect, action in
             guard let self = self else { return }
             self.activeSelectionWindow = nil
 
-            guard let localRect = selectedTopLeftRect, localRect.width >= 8, localRect.height >= 8 else {
+            guard let localRect = selectedTopLeftRect,
+                  let action = action,
+                  localRect.width >= 8,
+                  localRect.height >= 8 else {
                 completion(nil)
                 return
             }
@@ -101,7 +112,12 @@ final class ScreenCaptureSelector {
             let globalY = screen.frame.origin.y + (screen.frame.height - localRect.origin.y - localRect.height)
             let globalRect = NSRect(x: globalX, y: globalY, width: localRect.width, height: localRect.height)
 
-            completion(CapturedRegionResult(croppedImage: cropped, globalScreenRect: globalRect, scaleFactor: scale))
+            completion(CapturedRegionResult(
+                croppedImage: cropped,
+                globalScreenRect: globalRect,
+                scaleFactor: scale,
+                action: action
+            ))
         }
 
         activeSelectionWindow = win
@@ -127,9 +143,10 @@ final class ScreenCaptureSelector {
 
 /// 全屏定格框选窗口
 final class RegionSelectionWindow: NSPanel {
-    private var onComplete: ((CGRect?) -> Void)?
+    private var onComplete: ((CGRect?, CaptureSelectionAction?) -> Void)?
+    private weak var canvasView: RegionSelectionCanvasView?
 
-    init(screen: NSScreen, snapshot: CGImage, onComplete: @escaping (CGRect?) -> Void) {
+    init(screen: NSScreen, snapshot: CGImage, onComplete: @escaping (CGRect?, CaptureSelectionAction?) -> Void) {
         self.onComplete = onComplete
         super.init(
             contentRect: screen.frame,
@@ -147,9 +164,10 @@ final class RegionSelectionWindow: NSPanel {
         let view = RegionSelectionCanvasView(
             frame: NSRect(origin: .zero, size: screen.frame.size),
             snapshot: snapshot
-        ) { [weak self] rect in
-            self?.finish(with: rect)
+        ) { [weak self] rect, action in
+            self?.finish(with: rect, action: action)
         }
+        self.canvasView = view
         self.contentView = view
     }
 
@@ -157,39 +175,63 @@ final class RegionSelectionWindow: NSPanel {
     override var canBecomeMain: Bool { true }
 
     func cancelSelection() {
-        finish(with: nil)
+        finish(with: nil, action: nil)
     }
 
-    private func finish(with rect: CGRect?) {
+    private func finish(with rect: CGRect?, action: CaptureSelectionAction?) {
         NSCursor.arrow.set()
         let cb = onComplete
         onComplete = nil
         self.orderOut(nil)
         self.close()
-        cb?(rect)
+        cb?(rect, action)
     }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
-            finish(with: nil)
-        } else {
-            super.keyDown(with: event)
+            finish(with: nil, action: nil)
+            return
         }
+        if let canvas = canvasView, canvas.handleKeyDown(event) {
+            return
+        }
+        super.keyDown(with: event)
     }
 }
 
-/// 现代感全屏框选画布（十字导引线 + 双层发光描边 + 四角精致白色锚点）
+/// 现代感全屏框选画布（十字导引线 + 双层发光描边 + 四角精致白色锚点 + 选区极简动作工具条）
 final class RegionSelectionCanvasView: NSView {
     override var isFlipped: Bool { true }
 
+    private enum ToolbarButtonKind {
+        case translate
+        case pin
+        case copyImage
+        case cancel
+    }
+
+    private struct ToolbarButtonItem {
+        let kind: ToolbarButtonKind
+        let title: String?
+        let symbolName: String
+        let rect: NSRect
+        let isPrimary: Bool
+    }
+
     private let nsSnapshot: NSImage
-    private let onFinish: (CGRect?) -> Void
+    private let onFinish: (CGRect?, CaptureSelectionAction?) -> Void
     private var startPoint: NSPoint?
     private var currentPoint: NSPoint?
     private var hoverPoint: NSPoint?
     private var trackingArea: NSTrackingArea?
 
-    init(frame: NSRect, snapshot: CGImage, onFinish: @escaping (CGRect?) -> Void) {
+    private var isSelectionLocked = false
+    private var isDraggingSelection = false
+    private var toolbarRect: NSRect = .zero
+    private var toolbarButtons: [ToolbarButtonItem] = []
+    private var hoveredButton: ToolbarButtonKind?
+
+    init(frame: NSRect, snapshot: CGImage, onFinish: @escaping (CGRect?, CaptureSelectionAction?) -> Void) {
         self.nsSnapshot = NSImage(cgImage: snapshot, size: frame.size)
         self.onFinish = onFinish
         super.init(frame: frame)
@@ -229,32 +271,178 @@ final class RegionSelectionCanvasView: NSView {
         )
     }
 
+    func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard isSelectionLocked, let sel = selectionRect, sel.width >= 8, sel.height >= 8 else {
+            return false
+        }
+        switch event.keyCode {
+        case 36, 76, 49: // Return / Enter / Space
+            onFinish(sel, .translate)
+            return true
+        case 35: // P
+            onFinish(sel, .pin)
+            return true
+        case 8: // C
+            onFinish(sel, .copyImage)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func rebuildToolbarLayout() {
+        guard isSelectionLocked, let sel = selectionRect, sel.width >= 8, sel.height >= 8 else {
+            toolbarRect = .zero
+            toolbarButtons = []
+            hoveredButton = nil
+            return
+        }
+
+        let barHeight: CGFloat = 38
+        let padX: CGFloat = 6
+        let gap: CGFloat = 5
+        let btnHeight: CGFloat = 28
+
+        let specs: [(ToolbarButtonKind, String?, String, CGFloat, Bool)] = [
+            (.translate, "翻译", "character.bubble.fill", 72, true),
+            (.pin, "图钉", "pin.fill", 72, false),
+            (.copyImage, "复制", "doc.on.doc", 70, false),
+            (.cancel, nil, "xmark", 30, false)
+        ]
+
+        let totalButtonsWidth = specs.reduce(CGFloat(0)) { $0 + $1.3 } + gap * CGFloat(specs.count - 1)
+        let barWidth = totalButtonsWidth + padX * 2
+
+        let margin: CGFloat = 10
+        var barX = sel.maxX - barWidth
+        if barX < margin {
+            barX = sel.minX
+        }
+        barX = max(margin, min(barX, bounds.width - barWidth - margin))
+
+        let barY: CGFloat
+        if sel.maxY + 10 + barHeight <= bounds.height - margin {
+            barY = sel.maxY + 10
+        } else if sel.minY - 10 - barHeight >= margin {
+            barY = sel.minY - 10 - barHeight
+        } else {
+            barY = max(margin, min(sel.maxY - barHeight - 10, bounds.height - barHeight - margin))
+        }
+
+        toolbarRect = NSRect(x: barX, y: barY, width: barWidth, height: barHeight)
+
+        var items: [ToolbarButtonItem] = []
+        var cursorX = barX + padX
+        let btnY = barY + (barHeight - btnHeight) / 2
+        for spec in specs {
+            let rect = NSRect(x: cursorX, y: btnY, width: spec.3, height: btnHeight)
+            items.append(ToolbarButtonItem(
+                kind: spec.0,
+                title: spec.1,
+                symbolName: spec.2,
+                rect: rect,
+                isPrimary: spec.4
+            ))
+            cursorX += spec.3 + gap
+        }
+        toolbarButtons = items
+    }
+
+    private func triggerButton(_ kind: ToolbarButtonKind) {
+        guard let sel = selectionRect else { return }
+        switch kind {
+        case .translate:
+            onFinish(sel, .translate)
+        case .pin:
+            onFinish(sel, .pin)
+        case .copyImage:
+            onFinish(sel, .copyImage)
+        case .cancel:
+            onFinish(nil, nil)
+        }
+    }
+
     override func mouseMoved(with event: NSEvent) {
-        hoverPoint = convert(event.locationInWindow, from: nil)
-        if startPoint == nil {
+        let pt = convert(event.locationInWindow, from: nil)
+        hoverPoint = pt
+
+        if isSelectionLocked {
+            let hit = toolbarButtons.first(where: { $0.rect.contains(pt) })?.kind
+            if toolbarRect.contains(pt) {
+                NSCursor.arrow.set()
+            } else {
+                NSCursor.crosshair.set()
+            }
+            if hit != hoveredButton {
+                hoveredButton = hit
+                needsDisplay = true
+            }
+        } else if startPoint == nil {
             needsDisplay = true
         }
     }
 
     override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
+
+        if isSelectionLocked {
+            if let hit = toolbarButtons.first(where: { $0.rect.contains(pt) }) {
+                triggerButton(hit.kind)
+                return
+            }
+            if toolbarRect.contains(pt) {
+                return
+            }
+            // 双击已选区域内部快速触发默认翻译
+            if event.clickCount == 2, let sel = selectionRect, sel.contains(pt) {
+                onFinish(sel, .translate)
+                return
+            }
+        }
+
+        // 开始全新框选
+        isSelectionLocked = false
+        isDraggingSelection = true
+        hoveredButton = nil
+        toolbarRect = .zero
+        toolbarButtons = []
         startPoint = pt
         currentPoint = pt
+        NSCursor.crosshair.set()
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard isDraggingSelection else { return }
         currentPoint = convert(event.locationInWindow, from: nil)
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard isDraggingSelection else { return }
+        isDraggingSelection = false
         currentPoint = convert(event.locationInWindow, from: nil)
-        onFinish(selectionRect)
+
+        if let sel = selectionRect, sel.width >= 8, sel.height >= 8 {
+            isSelectionLocked = true
+            rebuildToolbarLayout()
+            let pt = convert(event.locationInWindow, from: nil)
+            hoveredButton = toolbarButtons.first(where: { $0.rect.contains(pt) })?.kind
+            if toolbarRect.contains(pt) {
+                NSCursor.arrow.set()
+            }
+        } else {
+            startPoint = nil
+            currentPoint = nil
+            isSelectionLocked = false
+            toolbarRect = .zero
+            toolbarButtons = []
+        }
+        needsDisplay = true
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        onFinish(nil)
+        onFinish(nil, nil)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -310,6 +498,11 @@ final class RegionSelectionCanvasView: NSView {
             let pillRect = NSRect(x: sel.minX, y: pillY, width: txtSize.width + 12, height: 22)
             drawGlassBadge(in: pillRect, radius: 11)
             sizeText.draw(at: NSPoint(x: pillRect.minX + 6, y: pillRect.minY + 3.5), withAttributes: attrs)
+
+            // 选区松手后浮出极简操作工具条
+            if isSelectionLocked && !toolbarButtons.isEmpty {
+                drawActionToolbar()
+            }
         } else {
             // 鼠标移动时绘制极细微的十字辅助参考线
             if let hp = hoverPoint {
@@ -324,7 +517,7 @@ final class RegionSelectionCanvasView: NSView {
             }
 
             // 顶部居中高颜值引导胶囊
-            let tip = "✦  截图秒译  ｜  拖拽框选区域即可原位替换中文   ·   右键或 Esc 取消" as NSString
+            let tip = "✦  截图秒译  ｜  拖拽框选区域 · 选择翻译或图钉贴图   ·   右键或 Esc 取消" as NSString
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont(name: "PingFangSC-Medium", size: 13.5) ?? NSFont.systemFont(ofSize: 13.5, weight: .medium),
                 .foregroundColor: NSColor.white
@@ -341,6 +534,86 @@ final class RegionSelectionCanvasView: NSView {
         }
     }
 
+    private func drawActionToolbar() {
+        drawGlassBadge(in: toolbarRect, radius: 11)
+
+        let font = NSFont(name: "PingFangSC-Medium", size: 12.5) ?? NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let symConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+
+        for item in toolbarButtons {
+            let isHovered = (hoveredButton == item.kind)
+            let btnPath = NSBezierPath(roundedRect: item.rect, xRadius: 7.5, yRadius: 7.5)
+
+            if item.isPrimary {
+                let fill = isHovered
+                    ? NSColor(calibratedRed: 0.18, green: 0.62, blue: 1.0, alpha: 1.0)
+                    : NSColor(calibratedRed: 0.11, green: 0.52, blue: 0.96, alpha: 0.95)
+                fill.setFill()
+                btnPath.fill()
+            } else if isHovered {
+                let fill = (item.kind == .cancel)
+                    ? NSColor(calibratedRed: 0.90, green: 0.28, blue: 0.26, alpha: 0.85)
+                    : NSColor.white.withAlphaComponent(0.18)
+                fill.setFill()
+                btnPath.fill()
+            }
+
+            let fgColor = NSColor.white.withAlphaComponent(item.isPrimary || isHovered ? 1.0 : 0.90)
+            let symbolImg = NSImage(systemSymbolName: item.symbolName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(symConfig)
+
+            if let title = item.title {
+                let nsTitle = title as NSString
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .foregroundColor: fgColor
+                ]
+                let titleSize = nsTitle.size(withAttributes: attrs)
+                let iconSize: CGFloat = 13
+                let iconGap: CGFloat = 5
+                let contentWidth = iconSize + iconGap + titleSize.width
+                let startX = item.rect.minX + (item.rect.width - contentWidth) / 2
+
+                if let img = symbolImg {
+                    let tinted = tintedTemplateImage(img, color: fgColor)
+                    let iconRect = NSRect(
+                        x: startX,
+                        y: item.rect.minY + (item.rect.height - iconSize) / 2,
+                        width: iconSize,
+                        height: iconSize
+                    )
+                    tinted.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+                }
+
+                let textOrigin = NSPoint(
+                    x: startX + iconSize + iconGap,
+                    y: item.rect.minY + (item.rect.height - titleSize.height) / 2 - 0.5
+                )
+                nsTitle.draw(at: textOrigin, withAttributes: attrs)
+            } else if let img = symbolImg {
+                let tinted = tintedTemplateImage(img, color: fgColor)
+                let iconSize: CGFloat = 12
+                let iconRect = NSRect(
+                    x: item.rect.minX + (item.rect.width - iconSize) / 2,
+                    y: item.rect.minY + (item.rect.height - iconSize) / 2,
+                    width: iconSize,
+                    height: iconSize
+                )
+                tinted.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+            }
+        }
+    }
+
+    private func tintedTemplateImage(_ image: NSImage, color: NSColor) -> NSImage {
+        let size = image.size
+        return NSImage(size: size, flipped: false) { rect in
+            image.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+    }
+
     private func drawGlassBadge(in rect: NSRect, radius: CGFloat) {
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
@@ -350,7 +623,7 @@ final class RegionSelectionCanvasView: NSView {
         NSGraphicsContext.saveGraphicsState()
         shadow.set()
         let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-        NSColor(calibratedRed: 0.08, green: 0.10, blue: 0.15, alpha: 0.82).setFill()
+        NSColor(calibratedRed: 0.08, green: 0.10, blue: 0.15, alpha: 0.86).setFill()
         path.fill()
         NSGraphicsContext.restoreGraphicsState()
 

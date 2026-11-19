@@ -27,6 +27,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.rebuildMenu()
         }
 
+        PinnedImageManager.shared.onCountChanged = { [weak self] in
+            self?.rebuildMenu()
+        }
+
         HotKeyManager.shared.onTriggerCapture = { [weak self] in
             Task { @MainActor in
                 self?.triggerInPlaceCapture()
@@ -147,6 +151,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clearItem.target = self
         menu.addItem(clearItem)
 
+        let pinnedCount = PinnedImageManager.shared.count
+        let clearPinsTitle = pinnedCount > 0 ? "清空全部贴图（\(pinnedCount)）" : "清空全部贴图"
+        let clearPinsItem = NSMenuItem(
+            title: clearPinsTitle,
+            action: #selector(handleClearPins),
+            keyEquivalent: ""
+        )
+        clearPinsItem.image = NSImage(systemSymbolName: "pin.slash", accessibilityDescription: nil)
+        clearPinsItem.target = self
+        clearPinsItem.isEnabled = pinnedCount > 0
+        menu.addItem(clearPinsItem)
+
         menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(
@@ -177,13 +193,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ScreenCaptureSelector.shared.startSelection { result in
             guard let captured = result else { return }
             Task { @MainActor in
-                InPlaceOverlayManager.shared.createAndTranslate(capture: captured)
+                switch captured.action {
+                case .translate:
+                    InPlaceOverlayManager.shared.createAndTranslate(capture: captured)
+                case .pin:
+                    PinnedImageManager.shared.pin(capture: captured)
+                case .copyImage:
+                    let rep = NSBitmapImageRep(cgImage: captured.croppedImage)
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        pb.setData(png, forType: .png)
+                    } else {
+                        let img = NSImage(cgImage: captured.croppedImage, size: captured.globalScreenRect.size)
+                        pb.writeObjects([img])
+                    }
+                }
             }
         }
     }
 
     @objc private func handleClearOverlays() {
         InPlaceOverlayManager.shared.closeAll()
+    }
+
+    @objc private func handleClearPins() {
+        PinnedImageManager.shared.closeAll()
     }
 
     @objc private func handleOpenSettings() {
